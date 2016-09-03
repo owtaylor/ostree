@@ -78,6 +78,7 @@ dist_test_scripts = \
 	tests/test-admin-pull-deploy-commit.sh \
 	tests/test-admin-locking.sh \
 	tests/test-admin-deploy-clean.sh \
+	tests/test-repo-checkout-differences.sh	\
 	tests/test-repo-checkout-subpath.sh	\
 	tests/test-reset-nonlinear.sh \
 	tests/test-oldstyle-partial.sh \

@@ -90,6 +90,16 @@ Boston, MA 02111-1307, USA.
             </varlistentry>
 
             <varlistentry>
+                <term><option>--apply-differences-from</option>="OTHER_COMMIT"</term>
+
+                <listitem><para>
+                  The specified path must exist and contain exactly a checkout
+                  of OTHER_COMMIT. It will be modified to contain the result of
+                  checking out COMMIT instead.
+                </para></listitem>
+            </varlistentry>
+
+            <varlistentry>
                 <term><option>--allow-noent</option></term>
 
                 <listitem><para>

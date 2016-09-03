@@ -36,6 +36,7 @@ static gboolean opt_allow_noent;
 static gboolean opt_disable_cache;
 static char *opt_subpath;
 static gboolean opt_union;
+static char *opt_apply_differences_from;
 static gboolean opt_whiteouts;
 static gboolean opt_from_stdin;
 static char *opt_from_file;
@@ -63,6 +64,7 @@ static GOptionEntry options[] = {
   { "disable-cache", 0, 0, G_OPTION_ARG_NONE, &opt_disable_cache, "Do not update or use the internal repository uncompressed object cache", NULL },
   { "subpath", 0, 0, G_OPTION_ARG_STRING, &opt_subpath, "Checkout sub-directory PATH", "PATH" },
   { "union", 0, 0, G_OPTION_ARG_NONE, &opt_union, "Keep existing directories, overwrite existing files", NULL },
+  { "apply-differences-from", 0, 0, G_OPTION_ARG_STRING, &opt_apply_differences_from, "Apply differences to an existing directory", "OTHER_COMMIT" },
   { "whiteouts", 0, 0, G_OPTION_ARG_NONE, &opt_whiteouts, "Process 'whiteout' (Docker style) entries", NULL },
   { "allow-noent", 0, 0, G_OPTION_ARG_NONE, &opt_allow_noent, "Do nothing if specified path does not exist", NULL },
   { "from-stdin", 0, 0, G_OPTION_ARG_NONE, &opt_from_stdin, "Process many checkouts from standard input", NULL },
@@ -75,6 +77,7 @@ static GOptionEntry options[] = {
 static gboolean
 process_one_checkout (OstreeRepo           *repo,
                       const char           *resolved_commit,
+                      const char           *differences_from_commit,
                       const char           *subpath,
                       const char           *destination,
                       GCancellable         *cancellable,
@@ -87,7 +90,7 @@ process_one_checkout (OstreeRepo           *repo,
    * `ostree_repo_checkout_at` until such time as we have a more
    * convenient infrastructure for testing C APIs with data.
    */
-  if (opt_disable_cache || opt_whiteouts || opt_require_hardlinks)
+  if (opt_disable_cache || opt_whiteouts || opt_require_hardlinks || differences_from_commit)
     {
       OstreeRepoCheckoutAtOptions options = { 0, };
       
@@ -100,6 +103,7 @@ process_one_checkout (OstreeRepo           *repo,
       if (subpath)
         options.subpath = subpath;
       options.no_copy_fallback = opt_require_hardlinks;
+      options.differences_from_commit = differences_from_commit;
 
       if (!ostree_repo_checkout_at (repo, &options,
                                     AT_FDCWD, destination,
@@ -207,7 +211,7 @@ process_many_checkouts (OstreeRepo         *repo,
       if (!ostree_repo_resolve_rev (repo, revision, FALSE, &resolved_commit, error))
         goto out;
 
-      if (!process_one_checkout (repo, resolved_commit, subpath, target,
+      if (!process_one_checkout (repo, resolved_commit, NULL, subpath, target,
                                  cancellable, error))
         {
           g_prefix_error (error, "Processing tree %s: ", resolved_commit);
@@ -236,6 +240,7 @@ ostree_builtin_checkout (int argc, char **argv, GCancellable *cancellable, GErro
   const char *commit;
   const char *destination;
   g_autofree char *resolved_commit = NULL;
+  g_autofree char *differences_from_commit = NULL;
 
   context = g_option_context_new ("COMMIT [DESTINATION] - Check out a commit into a filesystem tree");
 
@@ -257,6 +262,13 @@ ostree_builtin_checkout (int argc, char **argv, GCancellable *cancellable, GErro
 
   if (opt_from_stdin || opt_from_file)
     {
+      if (opt_apply_differences_from != NULL)
+        {
+          g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                               "--apply-differences-from can only used for a single checkout");
+          goto out;
+        }
+
       destination = argv[1];
 
       if (!process_many_checkouts (repo, destination, cancellable, error))
@@ -273,7 +285,13 @@ ostree_builtin_checkout (int argc, char **argv, GCancellable *cancellable, GErro
       if (!ostree_repo_resolve_rev (repo, commit, FALSE, &resolved_commit, error))
         goto out;
 
-      if (!process_one_checkout (repo, resolved_commit, opt_subpath,
+      if (opt_apply_differences_from)
+        if (!ostree_repo_resolve_rev (repo, opt_apply_differences_from, FALSE,
+                                      &differences_from_commit, error))
+          goto out;
+
+      if (!process_one_checkout (repo, resolved_commit, differences_from_commit,
+                                 opt_subpath,
                                  destination,
                                  cancellable, error))
         goto out;

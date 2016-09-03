@@ -759,7 +759,10 @@ typedef struct {
   OstreeRepoDevInoCache *devino_to_csum_cache;
 
   int unused_ints[6];
-  gpointer unused_ptrs[7];
+
+  const char *differences_from_commit;
+
+  gpointer unused_ptrs[6];
 } OstreeRepoCheckoutAtOptions;
 
 _OSTREE_PUBLIC

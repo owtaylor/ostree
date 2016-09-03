@@ -391,9 +391,11 @@ checkout_file_hardlink (OstreeRepo                          *self,
 
 static gboolean
 checkout_one_file_at (OstreeRepo                        *repo,
-                      OstreeRepoCheckoutAtOptions         *options,
+                      OstreeRepoCheckoutAtOptions       *options,
                       GFile                             *source,
                       GFileInfo                         *source_info,
+                      GFile                             *base,
+                      GFileInfo                         *base_info,
                       int                                destination_dfd,
                       const char                        *destination_name,
                       GCancellable                      *cancellable,
@@ -408,6 +410,18 @@ checkout_one_file_at (OstreeRepo                        *repo,
   g_autoptr(GInputStream) input = NULL;
   g_autoptr(GVariant) xattrs = NULL;
   gboolean is_whiteout;
+
+  if (base)
+    {
+      g_assert (g_file_info_get_file_type (source_info) != G_FILE_TYPE_DIRECTORY);
+
+      if (strcmp (ostree_repo_file_get_checksum ((OstreeRepoFile *)source),
+                  ostree_repo_file_get_checksum ((OstreeRepoFile *)base)) == 0)
+        return TRUE;
+
+      if (!glnx_shutil_rm_rf_at (destination_dfd, destination_name, cancellable, error))
+        goto out;
+    }
 
   is_symlink = g_file_info_get_file_type (source_info) == G_FILE_TYPE_SYMBOLIC_LINK;
 
@@ -632,6 +646,8 @@ checkout_tree_at (OstreeRepo                        *self,
                   const char                        *destination_name,
                   OstreeRepoFile                    *source,
                   GFileInfo                         *source_info,
+                  OstreeRepoFile                    *base,
+                  GFileInfo                         *base_info,
                   GCancellable                      *cancellable,
                   GError                           **error)
 {
@@ -642,21 +658,79 @@ checkout_tree_at (OstreeRepo                        *self,
   g_autoptr(GVariant) xattrs = NULL;
   g_autoptr(GFileEnumerator) dir_enum = NULL;
 
-  /* Create initially with mode 0700, then chown/chmod only when we're
-   * done.  This avoids anyone else being able to operate on partially
-   * constructed dirs.
-   */
-  do
-    res = mkdirat (destination_parent_fd, destination_name, 0700);
-  while (G_UNLIKELY (res == -1 && errno == EINTR));
-  if (res == -1)
+  if (base)
     {
-      if (errno == EEXIST && options->overwrite_mode == OSTREE_REPO_CHECKOUT_OVERWRITE_UNION_FILES)
-        did_exist = TRUE;
+      gboolean matches = FALSE;
+
+      if (g_file_info_get_file_type (source_info) == G_FILE_TYPE_DIRECTORY)
+        {
+          if (g_file_info_get_file_type (base_info) == G_FILE_TYPE_DIRECTORY)
+            {
+              /* This is basically a workaround for the fact that
+               * ostree_repo_file_get_checksum() doesn't produce a useful result
+               * on a root repo file - it just returns the metadata checksum,
+               * ignoring directory contents.
+               */
+              if (!ostree_repo_file_ensure_resolved (source, error) ||
+                  !ostree_repo_file_ensure_resolved (base, error))
+                goto out;
+
+              if (strcmp (ostree_repo_file_tree_get_contents_checksum (source),
+                          ostree_repo_file_tree_get_contents_checksum (base)) == 0 &&
+                  strcmp (ostree_repo_file_tree_get_metadata_checksum (source),
+                          ostree_repo_file_tree_get_metadata_checksum (base)) == 0)
+                matches = TRUE;
+            }
+          else
+            {
+              /* Didn't use to be a directory, remove the old file, start over */
+              if (!glnx_shutil_rm_rf_at (destination_parent_fd, destination_name, cancellable, error))
+                goto out;
+
+              base = NULL;
+              base_info = NULL;
+            }
+        }
       else
         {
-          glnx_set_error_from_errno (error);
+          /* This is the case (handled below) where the user is checking out a single file */
+          if (strcmp (ostree_repo_file_get_checksum (source),
+                      ostree_repo_file_get_checksum (base)) == 0)
+            matches = TRUE;
+        }
+
+      if (matches)
+        {
+          ret = TRUE;
           goto out;
+        }
+    }
+
+  /* If base is still set, then we know we already have the directory, so
+   * we don't create it, but to keep things simple, we leave did_exist=FALSE
+   * to repeat setting on the metadata, since otherwise we'd have to check
+   * if it changed. This is different from the union case where existing
+   * directories are left unmodified.
+   */
+
+  if (base == NULL)
+    {
+      /* Create initially with mode 0700, then chown/chmod only when we're
+       * done.  This avoids anyone else being able to operate on partially
+       * constructed dirs.
+       */
+      do
+        res = mkdirat (destination_parent_fd, destination_name, 0700);
+      while (G_UNLIKELY (res == -1 && errno == EINTR));
+      if (res == -1)
+        {
+          if (errno == EEXIST && options->overwrite_mode == OSTREE_REPO_CHECKOUT_OVERWRITE_UNION_FILES)
+            did_exist = TRUE;
+          else
+            {
+              glnx_set_error_from_errno (error);
+              goto out;
+            }
         }
     }
 
@@ -682,6 +756,8 @@ checkout_tree_at (OstreeRepo                        *self,
       ret = checkout_one_file_at (self, options,
                                   (GFile *) source,
                                   source_info,
+                                  (GFile *) base,
+                                  base_info,
                                   destination_dfd,
                                   g_file_info_get_name (source_info),
                                   cancellable, error);
@@ -699,6 +775,8 @@ checkout_tree_at (OstreeRepo                        *self,
     {
       GFileInfo *file_info;
       GFile *src_child;
+      g_autoptr(GFile) base_child = NULL;
+      g_autoptr(GFileInfo) base_child_info = NULL;
       const char *name;
 
       if (!g_file_enumerator_iterate (dir_enum, &file_info, &src_child,
@@ -709,11 +787,36 @@ checkout_tree_at (OstreeRepo                        *self,
 
       name = g_file_info_get_name (file_info);
 
+      if (base)
+        {
+          GError *temp_error = NULL;
+          base_child = g_file_get_child ((GFile *)base, name);
+          base_child_info = g_file_query_info (base_child, OSTREE_GIO_FAST_QUERYINFO,
+                                               G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS,
+                                               cancellable,
+                                               &temp_error);
+          if (!base_child_info)
+            {
+              if (g_error_matches (temp_error, G_IO_ERROR, G_IO_ERROR_NOT_FOUND))
+                {
+                  g_clear_error (&temp_error);
+                  g_clear_object (&base_child);
+                  g_clear_object (&base_child_info);
+                }
+              else
+                {
+                  g_propagate_error (error, temp_error);
+                  goto out;
+                }
+            }
+        }
+
       if (g_file_info_get_file_type (file_info) == G_FILE_TYPE_DIRECTORY)
         {
           if (!checkout_tree_at (self, options,
                                  destination_dfd, name,
                                  (OstreeRepoFile*)src_child, file_info,
+                                 (OstreeRepoFile *)base_child, base_child_info,
                                  cancellable, error))
             goto out;
         }
@@ -721,9 +824,62 @@ checkout_tree_at (OstreeRepo                        *self,
         {
           if (!checkout_one_file_at (self, options,
                                      src_child, file_info,
+                                     base_child, base_child_info,
                                      destination_dfd, name,
                                      cancellable, error))
             goto out;
+        }
+    }
+
+  /* When applying difference, delete any children in the base tree
+   * not in the current tree
+   */
+  if (base)
+    {
+      g_clear_object(&dir_enum);
+      dir_enum = g_file_enumerate_children ((GFile*)base,
+                                            OSTREE_GIO_FAST_QUERYINFO,
+                                            G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS,
+                                            cancellable, 
+                                            error);
+      if (!dir_enum)
+        goto out;
+
+      while (TRUE)
+        {
+          GFileInfo *file_info;
+          GFile *base_child;
+          g_autoptr(GFile) src_child = NULL;
+          g_autoptr(GFileInfo) src_child_info = NULL;
+          const char *name;
+          GError *temp_error = NULL;
+
+          if (!g_file_enumerator_iterate (dir_enum, &file_info, &base_child,
+                                          cancellable, error))
+            goto out;
+          if (file_info == NULL)
+            break;
+
+          name = g_file_info_get_name (file_info);
+
+          src_child = g_file_get_child ((GFile *)source, name);
+          src_child_info = g_file_query_info (src_child, OSTREE_GIO_FAST_QUERYINFO,
+                                              G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS,
+                                              cancellable,
+                                              &temp_error);
+          if (!src_child_info)
+            {
+              if (g_error_matches (temp_error, G_IO_ERROR, G_IO_ERROR_NOT_FOUND))
+                {
+                  if (!glnx_shutil_rm_rf_at (destination_dfd, name, cancellable, error))
+                    goto out;
+                }
+              else
+                {
+                  g_propagate_error (error, temp_error);
+                  goto out;
+                }
+            }
         }
     }
 
@@ -823,6 +979,7 @@ ostree_repo_checkout_tree (OstreeRepo               *self,
   return checkout_tree_at (self, &options,
                            AT_FDCWD, gs_file_get_path_cached (destination),
                            source, source_info,
+                           NULL, NULL,
                            cancellable, error);
 }
 
@@ -903,7 +1060,10 @@ ostree_repo_checkout_at (OstreeRepo                        *self,
   gboolean ret = FALSE;
   g_autoptr(GFile) commit_root = NULL;
   g_autoptr(GFile) target_dir = NULL;
+  g_autoptr(GFile) base_root = NULL;
+  g_autoptr(GFile) base_dir = NULL;
   g_autoptr(GFileInfo) target_info = NULL;
+  g_autoptr(GFileInfo) base_info = NULL;
   OstreeRepoCheckoutAtOptions default_options = { 0, };
 
   if (!options)
@@ -929,10 +1089,32 @@ ostree_repo_checkout_at (OstreeRepo                        *self,
   if (!target_info)
     goto out;
 
+  if (options->differences_from_commit)
+    {
+      base_root = (GFile*) _ostree_repo_file_new_for_commit (self, options->differences_from_commit, error);
+      if (!base_root)
+        goto out;
+
+      if (options->subpath && strcmp (options->subpath, "/") != 0)
+        base_dir = g_file_get_child (base_root, options->subpath);
+      else
+        base_dir = g_object_ref (base_root);
+
+      if (!ostree_repo_file_ensure_resolved ((OstreeRepoFile*)base_dir, error))
+        goto out;
+
+      base_info = g_file_query_info (base_dir, OSTREE_GIO_FAST_QUERYINFO,
+                                     G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS,
+                                     cancellable, error);
+      if (!base_info)
+        goto out;
+    }
+
   if (!checkout_tree_at (self, options,
                          destination_dfd,
                          destination_path,
                          (OstreeRepoFile*)target_dir, target_info,
+                         (OstreeRepoFile*)base_dir, base_info,
                          cancellable, error))
     goto out;
 
