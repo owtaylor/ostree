@@ -146,6 +146,12 @@ gboolean ostree_sysroot_write_deployments (OstreeSysroot     *self,
                                            GError           **error);
 
 _OSTREE_PUBLIC
+gboolean ostree_sysroot_write_deployments_no_cleanup (OstreeSysroot     *self,
+                                                      GPtrArray         *new_deployments,
+                                                      GCancellable      *cancellable,
+                                                      GError           **error);
+
+_OSTREE_PUBLIC
 gboolean ostree_sysroot_deploy_tree (OstreeSysroot     *self,
                                      const char        *osname,
                                      const char        *revision,
@@ -155,6 +161,18 @@ gboolean ostree_sysroot_deploy_tree (OstreeSysroot     *self,
                                      OstreeDeployment **out_new_deployment,
                                      GCancellable      *cancellable,
                                      GError           **error);
+
+_OSTREE_PUBLIC
+gboolean ostree_sysroot_deploy_tree_with_reuse (OstreeSysroot     *self,
+                                                const char        *osname,
+                                                const char        *revision,
+                                                GKeyFile          *origin,
+                                                OstreeDeployment  *provided_merge_deployment,
+                                                OstreeDeployment  *reuse_deployment,
+                                                char             **override_kernel_argv,
+                                                OstreeDeployment **out_new_deployment,
+                                                GCancellable      *cancellable,
+                                                GError           **error);
 
 _OSTREE_PUBLIC
 gboolean ostree_sysroot_deployment_set_mutable (OstreeSysroot     *self,

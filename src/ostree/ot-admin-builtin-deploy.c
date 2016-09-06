@@ -33,6 +33,7 @@
 #include <glib/gi18n.h>
 
 static gboolean opt_retain;
+static gboolean opt_reuse_oldest;
 static char **opt_kernel_argv;
 static char **opt_kernel_argv_append;
 static gboolean opt_kernel_proc_cmdline;
@@ -43,11 +44,65 @@ static GOptionEntry options[] = {
   { "os", 0, 0, G_OPTION_ARG_STRING, &opt_osname, "Use a different operating system root than the current one", "OSNAME" },
   { "origin-file", 0, 0, G_OPTION_ARG_FILENAME, &opt_origin_path, "Specify origin file", "FILENAME" },
   { "retain", 0, 0, G_OPTION_ARG_NONE, &opt_retain, "Do not delete previous deployment", NULL },
+  { "reuse-oldest", 0, 0, G_OPTION_ARG_NONE, &opt_reuse_oldest, "Destructively reuse an old deployment, if possible", NULL },
   { "karg-proc-cmdline", 0, 0, G_OPTION_ARG_NONE, &opt_kernel_proc_cmdline, "Import current /proc/cmdline", NULL },
   { "karg", 0, 0, G_OPTION_ARG_STRING_ARRAY, &opt_kernel_argv, "Set kernel argument, like root=/dev/sda1; this overrides any earlier argument with the same name", "NAME=VALUE" },
   { "karg-append", 0, 0, G_OPTION_ARG_STRING_ARRAY, &opt_kernel_argv_append, "Append kernel argument; useful with e.g. console= that can be used multiple times", "NAME=VALUE" },
   { NULL }
 };
+
+static gboolean
+get_reuse_deployment (OstreeSysroot     *sysroot,
+                      const char        *osname,
+                      OstreeDeployment  *merge_deployment,
+                      OstreeDeployment **reuse_deployment_out,
+                      GCancellable      *cancellable,
+                      GError           **error)
+{
+  g_autoptr(GPtrArray) current_deployments = NULL;
+  int i;
+  int reuse_index = -1;
+  glnx_unref_object OstreeDeployment *reuse_deployment = NULL;
+  OstreeDeployment *booted_deployment = ostree_sysroot_get_booted_deployment (sysroot);
+
+  if (osname == NULL)
+    osname = ostree_deployment_get_osname (booted_deployment);
+
+  current_deployments = ostree_sysroot_get_deployments (sysroot);
+  for (i = current_deployments->len - 1; i >= 0; i--)
+    {
+      OstreeDeployment *deployment = current_deployments->pdata[i];
+      const char *deploy_osname = ostree_deployment_get_osname (deployment);
+
+      if (strcmp (deploy_osname, osname) != 0)
+          continue;
+
+      if (deployment == merge_deployment)
+          continue;
+
+      if (deployment == booted_deployment)
+          continue;
+
+      reuse_index = i;
+      break;
+    }
+
+  if (reuse_index == -1)
+    {
+      *reuse_deployment_out = NULL;
+      return TRUE;
+    }
+
+  reuse_deployment = g_object_ref (current_deployments->pdata[reuse_index]);
+  g_ptr_array_remove_index (current_deployments, reuse_index);
+
+  if (!ostree_sysroot_write_deployments_no_cleanup (sysroot, current_deployments,
+                                                    cancellable, error))
+    return FALSE;
+
+  *reuse_deployment_out = g_object_ref (reuse_deployment);
+  return TRUE;
+}
 
 gboolean
 ot_admin_builtin_deploy (int argc, char **argv, GCancellable *cancellable, GError **error)
@@ -61,6 +116,7 @@ ot_admin_builtin_deploy (int argc, char **argv, GCancellable *cancellable, GErro
   g_autoptr(GPtrArray) new_deployments = NULL;
   glnx_unref_object OstreeDeployment *new_deployment = NULL;
   glnx_unref_object OstreeDeployment *merge_deployment = NULL;
+  glnx_unref_object OstreeDeployment *reuse_deployment = NULL;
   g_autofree char *revision = NULL;
   __attribute__((cleanup(_ostree_kernel_args_cleanup))) OstreeKernelArgs *kargs = NULL;
 
@@ -125,6 +181,13 @@ ot_admin_builtin_deploy (int argc, char **argv, GCancellable *cancellable, GErro
       goto out;
     }
 
+  if (opt_reuse_oldest)
+    if (!get_reuse_deployment (sysroot, opt_osname,
+                               merge_deployment,
+                               &reuse_deployment,
+                               cancellable, error))
+      goto out;
+
   kargs = _ostree_kernel_args_new ();
 
   /* If they want the current kernel's args, they very likely don't
@@ -156,11 +219,12 @@ ot_admin_builtin_deploy (int argc, char **argv, GCancellable *cancellable, GErro
   {
     g_auto(GStrv) kargs_strv = _ostree_kernel_args_to_strv (kargs);
 
-    if (!ostree_sysroot_deploy_tree (sysroot,
-                                     opt_osname, revision, origin,
-                                     merge_deployment, kargs_strv,
-                                     &new_deployment,
-                                     cancellable, error))
+    if (!ostree_sysroot_deploy_tree_with_reuse (sysroot,
+                                                opt_osname, revision, origin,
+                                                merge_deployment, reuse_deployment,
+                                                kargs_strv,
+                                                &new_deployment,
+                                                cancellable, error))
       goto out;
   }
 

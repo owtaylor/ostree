@@ -525,6 +525,7 @@ static gboolean
 checkout_deployment_tree (OstreeSysroot     *sysroot,
                           OstreeRepo        *repo,
                           OstreeDeployment  *deployment,
+                          OstreeDeployment  *reuse_deployment,
                           int               *out_deployment_dfd,
                           GCancellable      *cancellable,
                           GError           **error)
@@ -547,8 +548,33 @@ checkout_deployment_tree (OstreeSysroot     *sysroot,
   if (!glnx_opendirat (sysroot->sysroot_fd, osdeploy_path, TRUE, &osdeploy_dfd, error))
     goto out;
 
-  if (!glnx_shutil_rm_rf_at (osdeploy_dfd, checkout_target_name, cancellable, error))
-    goto out;
+  if (reuse_deployment)
+    {
+      const char *reuse_csum = ostree_deployment_get_csum (reuse_deployment);
+      int reuse_serial = ostree_deployment_get_deployserial (deployment);
+      g_autofree char *reuse_target_name = g_strdup_printf ("%s.%d", reuse_csum, reuse_serial);
+      g_autofree char *old_etc = g_strdup_printf ("%s/%s", reuse_target_name, "etc");
+      int res;
+
+      if (!glnx_shutil_rm_rf_at (osdeploy_dfd, old_etc, cancellable, error))
+        goto out;
+
+      do
+        res = renameat (osdeploy_dfd, reuse_target_name, osdeploy_dfd, checkout_target_name);
+      while (G_UNLIKELY (res == -1 && errno == EINTR));
+      if (res == -1)
+        {
+          glnx_set_error_from_errno (error);
+          goto out;
+        }
+
+      checkout_opts.differences_from_commit = reuse_csum;
+    }
+  else
+    {
+      if (!glnx_shutil_rm_rf_at (osdeploy_dfd, checkout_target_name, cancellable, error))
+        goto out;
+    }
 
   if (!ostree_repo_checkout_at (repo, &checkout_opts, osdeploy_dfd,
                                 checkout_target_name, csum,
@@ -1697,21 +1723,12 @@ is_ro_mount (const char *path)
   return FALSE;
 }
 
-/**
- * ostree_sysroot_write_deployments:
- * @self: Sysroot
- * @new_deployments: (element-type OstreeDeployment): List of new deployments
- * @cancellable: Cancellable
- * @error: Error
- *
- * Assuming @new_deployments have already been deployed in place on
- * disk, atomically update bootloader configuration.
- */
-gboolean
-ostree_sysroot_write_deployments (OstreeSysroot     *self,
-                                  GPtrArray         *new_deployments,
-                                  GCancellable      *cancellable,
-                                  GError           **error)
+static gboolean
+write_deployments (OstreeSysroot     *self,
+                   GPtrArray         *new_deployments,
+                   gboolean           cleanup,
+                   GCancellable      *cancellable,
+                   GError           **error)
 {
   gboolean ret = FALSE;
   guint i;
@@ -1935,12 +1952,15 @@ ostree_sysroot_write_deployments (OstreeSysroot     *self,
   if (!cleanup_legacy_current_symlinks (self, cancellable, error))
     goto out;
 
-  /* And finally, cleanup of any leftover data.
-   */
-  if (!ostree_sysroot_cleanup (self, cancellable, error))
+  if (cleanup)
     {
-      g_prefix_error (error, "Performing final cleanup: ");
-      goto out;
+      /* And finally, cleanup of any leftover data.
+       */
+      if (!ostree_sysroot_cleanup (self, cancellable, error))
+        {
+          g_prefix_error (error, "Performing final cleanup: ");
+          goto out;
+        }
     }
 
   ret = TRUE;
@@ -1958,6 +1978,45 @@ ostree_sysroot_write_deployments (OstreeSysroot     *self,
         }
     }
   return ret;
+}
+
+/**
+ * ostree_sysroot_write_deployments:
+ * @self: Sysroot
+ * @new_deployments: (element-type OstreeDeployment): List of new deployments
+ * @cancellable: Cancellable
+ * @error: Error
+ *
+ * Assuming @new_deployments have already been deployed in place on
+ * disk, atomically update bootloader configuration.
+ */
+gboolean
+ostree_sysroot_write_deployments (OstreeSysroot     *self,
+                                  GPtrArray         *new_deployments,
+                                  GCancellable      *cancellable,
+                                  GError           **error)
+{
+  return write_deployments (self, new_deployments, TRUE, cancellable, error);
+}
+
+/**
+ * ostree_sysroot_write_deployments_no_cleanup:
+ * @self: Sysroot
+ * @new_deployments: (element-type OstreeDeployment): List of new deployments
+ * @cancellable: Cancellable
+ * @error: Error
+ *
+ * Like ostree_sysroot_write_deployments(), but ostree_sysroot_cleanup (), is not called.
+ * This can be useful as an intermediate steps if an old checkout is going to
+ * be reused.
+ */
+gboolean
+ostree_sysroot_write_deployments_no_cleanup (OstreeSysroot     *self,
+                                             GPtrArray         *new_deployments,
+                                             GCancellable      *cancellable,
+                                             GError           **error)
+{
+  return write_deployments (self, new_deployments, FALSE, cancellable, error);
 }
 
 static gboolean
@@ -2000,30 +2059,32 @@ allocate_deployserial (OstreeSysroot           *self,
 }
                             
 /**
- * ostree_sysroot_deploy_tree:
+ * ostree_sysroot_deploy_tree_with_reuse:
  * @self: Sysroot
  * @osname: (allow-none): osname to use for merge deployment
  * @revision: Checksum to add
  * @origin: (allow-none): Origin to use for upgrades
  * @provided_merge_deployment: (allow-none): Use this deployment for merge path
+ * @reuse_deployment: (allow-none): Take the checkout for this deployment, and update it to be the checkout for the new deployment.
  * @override_kernel_argv: (allow-none) (array zero-terminated=1) (element-type utf8): Use these as kernel arguments; if %NULL, inherit options from provided_merge_deployment
  * @out_new_deployment: (out): The new deployment path
  * @cancellable: Cancellable
  * @error: Error
  *
- * Check out deployment tree with revision @revision, performing a 3
- * way merge with @provided_merge_deployment for configuration.
+ * Like ostree_sysroot_deploy_tree(), but it's possible to specify an old deployment that
+ * should be destructively modified into the new deployment.
  */
 gboolean
-ostree_sysroot_deploy_tree (OstreeSysroot     *self,
-                            const char        *osname,
-                            const char        *revision,
-                            GKeyFile          *origin,
-                            OstreeDeployment  *provided_merge_deployment,
-                            char             **override_kernel_argv,
-                            OstreeDeployment **out_new_deployment,
-                            GCancellable      *cancellable,
-                            GError           **error)
+ostree_sysroot_deploy_tree_with_reuse (OstreeSysroot     *self,
+                                       const char        *osname,
+                                       const char        *revision,
+                                       GKeyFile          *origin,
+                                       OstreeDeployment  *provided_merge_deployment,
+                                       OstreeDeployment  *reuse_deployment,
+                                       char             **override_kernel_argv,
+                                       OstreeDeployment **out_new_deployment,
+                                       GCancellable      *cancellable,
+                                       GError           **error)
 {
   gboolean ret = FALSE;
   gint new_deployserial;
@@ -2070,7 +2131,8 @@ ostree_sysroot_deploy_tree (OstreeSysroot     *self,
   ostree_deployment_set_origin (new_deployment, origin);
 
   /* Check out the userspace tree onto the filesystem */
-  if (!checkout_deployment_tree (self, repo, new_deployment, &deployment_dfd,
+  if (!checkout_deployment_tree (self, repo, new_deployment, reuse_deployment,
+                                 &deployment_dfd,
                                  cancellable, error))
     {
       g_prefix_error (error, "Checking out tree: ");
@@ -2165,6 +2227,37 @@ ostree_sysroot_deploy_tree (OstreeSysroot     *self,
   ot_transfer_out_value (out_new_deployment, &new_deployment);
  out:
   return ret;
+}
+
+/**
+ * ostree_sysroot_deploy_tree:
+ * @self: Sysroot
+ * @osname: (allow-none): osname to use for merge deployment
+ * @revision: Checksum to add
+ * @origin: (allow-none): Origin to use for upgrades
+ * @provided_merge_deployment: (allow-none): Use this deployment for merge path
+ * @override_kernel_argv: (allow-none) (array zero-terminated=1) (element-type utf8): Use these as kernel arguments; if %NULL, inherit options from provided_merge_deployment
+ * @out_new_deployment: (out): The new deployment path
+ * @cancellable: Cancellable
+ * @error: Error
+ *
+ * Check out deployment tree with revision @revision, performing a 3
+ * way merge with @provided_merge_deployment for configuration.
+ */
+gboolean
+ostree_sysroot_deploy_tree (OstreeSysroot     *self,
+                            const char        *osname,
+                            const char        *revision,
+                            GKeyFile          *origin,
+                            OstreeDeployment  *provided_merge_deployment,
+                            char             **override_kernel_argv,
+                            OstreeDeployment **out_new_deployment,
+                            GCancellable      *cancellable,
+                            GError           **error)
+{
+  return ostree_sysroot_deploy_tree_with_reuse (self, osname, revision, origin, provided_merge_deployment,
+                                                NULL,
+                                                override_kernel_argv, out_new_deployment, cancellable, error);
 }
 
 /**
